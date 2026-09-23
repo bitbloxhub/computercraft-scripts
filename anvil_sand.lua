@@ -1,6 +1,8 @@
 -- Anvil crusher loop for Carpet Extra's renewableSand mechanic.
--- Place a chest two blocks behind the turtle's cobblestone position.
--- The turtle returns to its cobblestone position after every dump.
+-- Layout:
+-- y:   [chest]           [air]             [air]             [turtle]          [air]
+-- y-1:                   [water source]    [water flowing]   [cobblestone]     [lava source]
+-- Turtle returns to its cobblestone position after every dump.
 local COBBLESTONE = "minecraft:cobblestone"
 local ANVILS = {
 	["minecraft:anvil"] = true,
@@ -10,6 +12,64 @@ local SAND = "minecraft:sand"
 local CHECK_DELAY = 1
 local MAX_EMPTY_SLOTS = 1
 local DUMP_BACK_STEPS = 2
+local lava_source_converision = true
+local LOW_FUEL_LEVEL = 100
+local BUCKETS = {
+	["minecraft:bucket"] = true,
+	["minecraft:lava_bucket"] = true,
+}
+
+local function fuelLevel()
+	return turtle.getFuelLevel()
+end
+
+local function findBucket()
+	for slot = 1, 16 do
+		local item = turtle.getItemDetail(slot)
+		if item and item.name == "minecraft:bucket" then
+			return slot
+		end
+	end
+	return nil
+end
+
+local function refuelFromLava()
+	if not lava_source_converision then
+		return
+	end
+
+	local bucketSlot = findBucket()
+	if not bucketSlot then
+		error("Lava refuelling enabled, but no bucket was found")
+	end
+
+	while fuelLevel() ~= "unlimited" and fuelLevel() < turtle.getFuelLimit() do
+		while not turtle.forward() do
+			os.sleep(CHECK_DELAY)
+		end
+
+		turtle.select(bucketSlot)
+		while not turtle.placeDown() do
+			os.sleep(CHECK_DELAY)
+		end
+		turtle.select(bucketSlot)
+		if not turtle.refuel(1) then
+			error("Collected lava, but turtle could not refuel")
+		end
+
+		while not turtle.back() do
+			os.sleep(CHECK_DELAY)
+		end
+	end
+end
+
+local function ensureFuel()
+	local level = fuelLevel()
+	if level == "unlimited" or level >= LOW_FUEL_LEVEL then
+		return
+	end
+	refuelFromLava()
+end
 
 -- Wait until a particular block appears on one side.
 local function waitForBlock(side, name)
@@ -83,7 +143,7 @@ local function dumpInventory()
 
 	for slot = 1, 16 do
 		local item = turtle.getItemDetail(slot)
-		if item and not ANVILS[item.name] then
+		if item and not ANVILS[item.name] and not BUCKETS[item.name] then
 			turtle.select(slot)
 			while turtle.getItemCount(slot) > 0 do
 				if turtle.drop() then
@@ -117,6 +177,7 @@ local function dumpIfNeeded()
 		return
 	end
 
+	ensureFuel()
 	for _ = 1, DUMP_BACK_STEPS do
 		while not turtle.back() do
 			os.sleep(CHECK_DELAY)
@@ -130,16 +191,26 @@ local function dumpIfNeeded()
 	end
 end
 
--- Recover after restart based on anvil in front or sand below.
+-- Recover after restart from anvil above, anvil in front, or sand below.
 local function resumeFromSurroundings()
-	local found, block = turtle.inspect()
-	if found and ANVILS[block.name] then
+	local foundUp, blockUp = turtle.inspectUp()
+	if foundUp and ANVILS[blockUp.name] then
+		ensureFuel()
+		while not turtle.back() do
+			os.sleep(CHECK_DELAY)
+		end
+		waitForAnvil()
 		mineAnvilAndSand()
 	else
-		local foundDown, blockDown = turtle.inspectDown()
-		if foundDown and blockDown.name == SAND then
-			while not turtle.digDown() do
-				os.sleep(CHECK_DELAY)
+		local found, block = turtle.inspect()
+		if found and ANVILS[block.name] then
+			mineAnvilAndSand()
+		else
+			local foundDown, blockDown = turtle.inspectDown()
+			if foundDown and blockDown.name == SAND then
+				while not turtle.digDown() do
+					os.sleep(CHECK_DELAY)
+				end
 			end
 		end
 	end
@@ -161,10 +232,12 @@ while true do
 		error("Turtle ran out of anvils")
 	end
 
+	ensureFuel()
 	while not turtle.placeUp() do
 		os.sleep(CHECK_DELAY)
 	end
 
+	ensureFuel()
 	while not turtle.back() do
 		os.sleep(CHECK_DELAY)
 	end
