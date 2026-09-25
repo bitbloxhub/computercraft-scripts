@@ -14,6 +14,7 @@ local MAX_EMPTY_SLOTS = 1
 local DUMP_BACK_STEPS = 2
 local lava_source_converision = true
 local LOW_FUEL_LEVEL = 100
+local STATE_FILE = "anvil_sand.state"
 local BUCKETS = {
 	["minecraft:bucket"] = true,
 	["minecraft:lava_bucket"] = true,
@@ -33,34 +34,126 @@ local function findBucket()
 	return nil
 end
 
+local function findLavaBucket()
+	for slot = 1, 16 do
+		local item = turtle.getItemDetail(slot)
+		if item and item.name == "minecraft:lava_bucket" then
+			return slot
+		end
+	end
+	return nil
+end
+
+local function setState(state)
+	local file = fs.open(STATE_FILE, "w")
+	file.write(state)
+	file.close()
+end
+
+local function getState()
+	if not fs.exists(STATE_FILE) then
+		return nil
+	end
+
+	local file = fs.open(STATE_FILE, "r")
+	local state = file.readAll()
+	file.close()
+	return state
+end
+
+local function clearState()
+	if fs.exists(STATE_FILE) then
+		fs.delete(STATE_FILE)
+	end
+end
+
 local function refuelFromLava()
 	if not lava_source_converision then
 		return
 	end
 
-	local bucketSlot = findBucket()
-	if not bucketSlot then
-		error("Lava refuelling enabled, but no bucket was found")
-	end
-
+	local parentState = getState() or "idle"
 	while fuelLevel() ~= "unlimited" and fuelLevel() < turtle.getFuelLimit() do
+		setState("refueling:" .. parentState)
 		while not turtle.forward() do
 			os.sleep(CHECK_DELAY)
 		end
 
-		turtle.select(bucketSlot)
-		while not turtle.placeDown() do
-			os.sleep(CHECK_DELAY)
+		local foundDown, blockDown = turtle.inspectDown()
+		if foundDown and blockDown.name == "minecraft:lava" then
+			local bucketSlot = findBucket()
+			if not bucketSlot then
+				error("Collected lava, but no empty bucket was found")
+			end
+			turtle.select(bucketSlot)
+			while not turtle.placeDown() do
+				os.sleep(CHECK_DELAY)
+			end
 		end
-		turtle.select(bucketSlot)
-		if not turtle.refuel(1) then
-			error("Collected lava, but turtle could not refuel")
+
+		local lavaBucketSlot = findLavaBucket()
+		if lavaBucketSlot then
+			turtle.select(lavaBucketSlot)
+			if not turtle.refuel(1) then
+				error("Collected lava, but turtle could not refuel")
+			end
 		end
 
 		while not turtle.back() do
 			os.sleep(CHECK_DELAY)
 		end
+		if parentState == "idle" then
+			clearState()
+		else
+			setState(parentState)
+		end
 	end
+end
+
+local function resumeRefueling()
+	local state = getState()
+	if not state or not state:find("^refueling:") then
+		return nil
+	end
+	local parentState = state:sub(#"refueling:" + 1)
+
+	local foundDown, blockDown = turtle.inspectDown()
+	if foundDown and blockDown.name == COBBLESTONE then
+		if parentState == "idle" then
+			clearState()
+		else
+			setState(parentState)
+		end
+		return parentState
+	end
+	if foundDown and blockDown.name == "minecraft:lava" then
+		local bucketSlot = findBucket()
+		if not bucketSlot then
+			error("Resuming refuelling, but no empty bucket was found")
+		end
+		turtle.select(bucketSlot)
+		while not turtle.placeDown() do
+			os.sleep(CHECK_DELAY)
+		end
+	end
+
+	local lavaBucketSlot = findLavaBucket()
+	if lavaBucketSlot then
+		turtle.select(lavaBucketSlot)
+		if not turtle.refuel(1) then
+			error("Resumed lava collection, but turtle could not refuel")
+		end
+	end
+
+	while not turtle.back() do
+		os.sleep(CHECK_DELAY)
+	end
+	if parentState == "idle" then
+		clearState()
+	else
+		setState(parentState)
+	end
+	return parentState
 end
 
 local function ensureFuel()
@@ -160,14 +253,28 @@ end
 
 -- Remove the fallen anvil, move into its position, then mine sand below.
 local function mineAnvilAndSand()
-	while not turtle.dig() do
-		os.sleep(CHECK_DELAY)
+	setState("mining_anvil")
+	local found, block = turtle.inspect()
+	if found and ANVILS[block.name] then
+		while not turtle.dig() do
+			os.sleep(CHECK_DELAY)
+		end
 	end
-	while not turtle.forward() do
-		os.sleep(CHECK_DELAY)
+
+	setState("moving_to_sand")
+	local foundDown, blockDown = turtle.inspectDown()
+	if not foundDown or blockDown.name ~= SAND then
+		while not turtle.forward() do
+			os.sleep(CHECK_DELAY)
+		end
 	end
-	while not turtle.digDown() do
-		os.sleep(CHECK_DELAY)
+
+	setState("mining_sand")
+	foundDown, blockDown = turtle.inspectDown()
+	if foundDown and blockDown.name == SAND then
+		while not turtle.digDown() do
+			os.sleep(CHECK_DELAY)
+		end
 	end
 end
 
@@ -177,6 +284,7 @@ local function dumpIfNeeded()
 		return
 	end
 
+	setState("dumping")
 	ensureFuel()
 	for _ = 1, DUMP_BACK_STEPS do
 		while not turtle.back() do
@@ -191,31 +299,60 @@ local function dumpIfNeeded()
 	end
 end
 
--- Recover after restart from anvil above, anvil in front, or sand below.
-local function resumeFromSurroundings()
-	local foundUp, blockUp = turtle.inspectUp()
-	if foundUp and ANVILS[blockUp.name] then
-		ensureFuel()
-		while not turtle.back() do
-			os.sleep(CHECK_DELAY)
-		end
-		waitForAnvil()
-		mineAnvilAndSand()
-	else
-		local found, block = turtle.inspect()
-		if found and ANVILS[block.name] then
-			mineAnvilAndSand()
-		else
-			local foundDown, blockDown = turtle.inspectDown()
-			if foundDown and blockDown.name == SAND then
-				while not turtle.digDown() do
-					os.sleep(CHECK_DELAY)
-				end
-			end
-		end
+local function resumeState()
+	local state = getState()
+	if not state then
+		return false
 	end
 
-	dumpIfNeeded()
+	local refuelingParent = resumeRefueling()
+	if refuelingParent then
+		state = refuelingParent
+	end
+
+	if state == "placing_anvil" then
+		local found, block = turtle.inspectUp()
+		if not found or not ANVILS[block.name] then
+			if not selectAnvil() then
+				error("Turtle ran out of anvils")
+			end
+			ensureFuel()
+			while not turtle.placeUp() do
+				os.sleep(CHECK_DELAY)
+			end
+		end
+		setState("backing_up")
+		state = "backing_up"
+	end
+
+	if state == "backing_up" then
+		local found, block = turtle.inspectUp()
+		if found and ANVILS[block.name] then
+			ensureFuel()
+			while not turtle.back() do
+				os.sleep(CHECK_DELAY)
+			end
+		end
+		setState("waiting_anvil")
+		state = "waiting_anvil"
+	end
+
+	if state == "waiting_anvil" then
+		waitForAnvil()
+		setState("mining_anvil")
+		state = "mining_anvil"
+	end
+
+	if state == "mining_anvil" or state == "moving_to_sand" or state == "mining_sand" then
+		mineAnvilAndSand()
+		state = "dumping"
+	end
+
+	if state == "dumping" then
+		dumpIfNeeded()
+		clearState()
+	end
+	return true
 end
 
 
@@ -225,24 +362,30 @@ end
 
 -- Main loop: recover, wait for cobblestone, place anvil, and repeat.
 while true do
-	resumeFromSurroundings()
+	resumeState()
 	waitForBlock(turtle.inspectDown, COBBLESTONE)
 
+	setState("placing_anvil")
 	if not selectAnvil() then
 		error("Turtle ran out of anvils")
 	end
-
 	ensureFuel()
 	while not turtle.placeUp() do
 		os.sleep(CHECK_DELAY)
 	end
 
+	setState("backing_up")
 	ensureFuel()
 	while not turtle.back() do
 		os.sleep(CHECK_DELAY)
 	end
 
+	setState("waiting_anvil")
 	waitForAnvil()
+
 	mineAnvilAndSand()
+
+	setState("dumping")
 	dumpIfNeeded()
+	clearState()
 end
